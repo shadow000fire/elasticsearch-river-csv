@@ -18,12 +18,29 @@
 
 package org.elasticsearch.river.csv;
 
-import au.com.bytecode.opencsv.CSVReader;
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileReader;
+import java.io.FilenameFilter;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.io.Reader;
+import java.io.StringReader;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import org.apache.http.client.methods.CloseableHttpResponse;
+import org.apache.http.client.methods.HttpGet;
+import org.apache.http.impl.client.CloseableHttpClient;
+import org.apache.http.impl.client.HttpClients;
 import org.elasticsearch.action.ActionListener;
+import org.elasticsearch.action.bulk.BulkItemResponse;
 import org.elasticsearch.action.bulk.BulkRequestBuilder;
 import org.elasticsearch.action.bulk.BulkResponse;
 import org.elasticsearch.client.Client;
 import org.elasticsearch.client.Requests;
+import org.elasticsearch.common.Base64;
 import org.elasticsearch.common.inject.Inject;
 import org.elasticsearch.common.unit.TimeValue;
 import org.elasticsearch.common.util.concurrent.EsExecutors;
@@ -34,27 +51,18 @@ import org.elasticsearch.river.AbstractRiverComponent;
 import org.elasticsearch.river.River;
 import org.elasticsearch.river.RiverName;
 import org.elasticsearch.river.RiverSettings;
-import org.elasticsearch.threadpool.ThreadPool;
 
-import java.io.File;
-import java.io.FileReader;
-import java.io.FilenameFilter;
-import java.io.IOException;
-import java.util.List;
-import java.util.Map;
-import java.util.UUID;
-import java.util.concurrent.atomic.AtomicInteger;
+import au.com.bytecode.opencsv.CSVReader;
 
 /**
  *
  */
 public class CSVRiver extends AbstractRiverComponent implements River {
 
-    private final ThreadPool threadPool;
     private final Client client;
-    private final String indexName;
-    private final String typeName;
-    private final int bulkSize;
+    private String indexName;
+    private String typeName;
+    private int bulkSize;
     private String folderName;
     private String filenamePattern;
     private volatile BulkRequestBuilder currentRequest;
@@ -68,39 +76,12 @@ public class CSVRiver extends AbstractRiverComponent implements River {
     private AtomicInteger onGoingBulks = new AtomicInteger();
     private int bulkThreshold;
 
-    @SuppressWarnings({"unchecked"})
     @Inject
-    public CSVRiver(RiverName riverName, RiverSettings settings, Client client, ThreadPool threadPool) {
+    public CSVRiver(RiverName riverName, RiverSettings settings, Client client) {
         super(riverName, settings);
         this.client = client;
-        this.threadPool = threadPool;
-
-        if (settings.settings().containsKey("csv_file")) {
-            Map<String, Object> csvSettings = (Map<String, Object>) settings.settings().get("csv_file");
-            folderName = XContentMapValues.nodeStringValue(csvSettings.get("folder"), null);
-            filenamePattern = XContentMapValues.nodeStringValue(csvSettings.get("filename_pattern"), ".*\\.csv$");
-            csvFields = XContentMapValues.extractRawValues("fields", csvSettings);
-            poll = XContentMapValues.nodeTimeValue(csvSettings.get("poll"), TimeValue.timeValueMinutes(60));
-            escapeCharacter = XContentMapValues.nodeStringValue(csvSettings.get("escape_character"), String.valueOf(CSVReader.DEFAULT_ESCAPE_CHARACTER)).charAt(0);
-            separator = XContentMapValues.nodeStringValue(csvSettings.get("field_separator"), String.valueOf(CSVReader.DEFAULT_SEPARATOR)).charAt(0);
-            quoteCharacter = XContentMapValues.nodeStringValue(csvSettings.get("quote_character"), String.valueOf(CSVReader.DEFAULT_QUOTE_CHARACTER)).charAt(0);
-        }
-
-        logger.info("creating csv stream river for [{}] with pattern [{}]", folderName, filenamePattern);
-
-        if (settings.settings().containsKey("index")) {
-            Map<String, Object> indexSettings = (Map<String, Object>) settings.settings().get("index");
-            indexName = XContentMapValues.nodeStringValue(indexSettings.get("index"), riverName.name());
-            typeName = XContentMapValues.nodeStringValue(indexSettings.get("type"), "csv_type");
-            bulkSize = XContentMapValues.nodeIntegerValue(indexSettings.get("bulk_size"), 100);
-            bulkThreshold = XContentMapValues.nodeIntegerValue(indexSettings.get("bulk_threshold"), 10);
-        } else {
-            indexName = riverName.name();
-            typeName = "csv_type";
-            bulkSize = 100;
-            bulkThreshold = 10;
-        }
-
+        
+        logger.info("creating csv stream river {}", riverName.getName());
     }
 
     @Override
@@ -115,7 +96,11 @@ public class CSVRiver extends AbstractRiverComponent implements River {
     public void close() {
         logger.info("closing csv stream river");
         this.closed = true;
-        thread.interrupt();
+        try {
+			thread.join(3000);
+			thread.interrupt();
+		} catch (InterruptedException e) {
+		}
     }
 
     private void delay() {
@@ -124,14 +109,25 @@ public class CSVRiver extends AbstractRiverComponent implements River {
             try {
                 Thread.sleep(poll.millis());
             } catch (InterruptedException e) {
-                logger.error("Error during waiting.", e, (Object) null);
+            	if(!closed)
+            	{
+            		logger.error("Error during waiting.", e, (Object) null);
+            	}
             }
+        }
+        else
+        {
+        	logger.info("No delay set, shutting down.");
         }
     }
 
+    private synchronized void notifyThread()
+    {
+    	this.notify();
+    }
 
-    private void processBulkIfNeeded() {
-        if (currentRequest.numberOfActions() >= bulkSize) {
+    private void processBulkIfNeeded(boolean force, final long startAt) {
+        if (currentRequest.numberOfActions() >= bulkSize || (force && currentRequest.numberOfActions()>0)) {
             // execute the bulk operation
             int currentOnGoingBulks = onGoingBulks.incrementAndGet();
             if (currentOnGoingBulks > bulkThreshold) {
@@ -142,61 +138,131 @@ public class CSVRiver extends AbstractRiverComponent implements River {
                         wait();
                     }
                 } catch (InterruptedException e) {
-                    logger.error("Error during wait", e);
+                	if(!closed)
+                	{
+                		logger.error("Error during wait", e);
+                	}
                 }
             }
-            {
-                try {
-                    currentRequest.execute(new ActionListener<BulkResponse>() {
-                        @Override
-                        public void onResponse(BulkResponse bulkResponse) {
-                            onGoingBulks.decrementAndGet();
-                            notifyCSVRiver();
+            
+            try {
+            	logger.info("executing bulk");
+                currentRequest.execute(new ActionListener<BulkResponse>() {
+                    @Override
+                    public void onResponse(BulkResponse bulkResponse) {
+                        onGoingBulks.decrementAndGet();
+                        notifyThread();
+                        if(bulkResponse.hasFailures())
+                        {
+                        	BulkItemResponse[] items=bulkResponse.getItems();
+                        	for(int ii=0;ii<items.length;ii++)
+                        	{
+                        		if(items[ii].isFailed())
+                        		{
+                        			logger.error("Failure at line {}:{}", startAt+(long)ii, items[ii].getFailure().getMessage());
+                        		}
+                        	}
                         }
+                    }
 
-                        @Override
-                        public void onFailure(Throwable e) {
-                            onGoingBulks.decrementAndGet();
-                            notifyCSVRiver();
-                            logger.warn("failed to execute bulk");
-                        }
-                    });
-                } catch (Exception e) {
-                    onGoingBulks.decrementAndGet();
-                    notifyCSVRiver();
-                    logger.warn("failed to process bulk", e);
-                }
+                    @Override
+                    public void onFailure(Throwable e) {
+                        onGoingBulks.decrementAndGet();
+                        notify();
+                        logger.error("failed to execute bulk");
+                    }
+                });
+            } catch (Exception e) {
+                onGoingBulks.decrementAndGet();
+                notifyThread();
+                logger.error("failed to process bulk", e);
             }
             currentRequest = client.prepareBulk();
         }
     }
 
-    private void notifyCSVRiver() {
-        synchronized (CSVRiver.this) {
-            CSVRiver.this.notify();
-        }
-    }
-
     private class CSVConnector implements Runnable {
 
+    	@SuppressWarnings({"unchecked"})
         @Override
         public void run() {
-            while (!closed) {
+        	Reader reader=null;
+        	
+        	csvFields = XContentMapValues.extractRawValues("fields", settings.settings());
+            poll = XContentMapValues.nodeTimeValue(settings.settings().get("poll"), TimeValue.timeValueMinutes(0));
+            escapeCharacter = XContentMapValues.nodeStringValue(settings.settings().get("escape_character"), String.valueOf(CSVReader.DEFAULT_ESCAPE_CHARACTER)).charAt(0);
+            separator = XContentMapValues.nodeStringValue(settings.settings().get("field_separator"), String.valueOf(CSVReader.DEFAULT_SEPARATOR)).charAt(0);
+            quoteCharacter = XContentMapValues.nodeStringValue(settings.settings().get("quote_character"), String.valueOf(CSVReader.DEFAULT_QUOTE_CHARACTER)).charAt(0);
+        	
+            if (settings.settings().containsKey("index")) {
+                Map<String, Object> indexSettings = (Map<String, Object>) settings.settings().get("index");
+                indexName = XContentMapValues.nodeStringValue(indexSettings.get("index"), riverName.name());
+                typeName = XContentMapValues.nodeStringValue(indexSettings.get("type"), "csv_type");
+                bulkSize = XContentMapValues.nodeIntegerValue(indexSettings.get("bulk_size"), 100);
+                bulkThreshold = XContentMapValues.nodeIntegerValue(indexSettings.get("bulk_threshold"), 10);
+            } else {
+                indexName = "csv_"+riverName.name();
+                typeName = "csv_type";
+                bulkSize = 100;
+                bulkThreshold = 10;
+            }
+            
+        	if(settings.settings().containsKey("csv_string"))
+            {
+            	try {
+            		reader=new BufferedReader(new StringReader(XContentMapValues.nodeStringValue(settings.settings().get("csv_string"), null)));
+					processReader(reader,"csv_string");
+				} catch (IOException e) {
+					logger.error("Error processing csv_string", e);
+				}
+            }
+        	else if(settings.settings().containsKey("csv_data"))
+            {
+				try {
+					byte[] decoded = Base64.decode(XContentMapValues.nodeStringValue(settings.settings().get("csv_data"), null));
+					reader=new BufferedReader(new StringReader(new String(decoded,"UTF-8")+"\n"));
+	            	processReader(reader,"csv_data");
+				} catch (IOException e) {
+					logger.error("Error processing csv_data", e);
+				}
+            }
+            else if (settings.settings().containsKey("csv_file")) {
+            	logger.info("found csv_file");
+                Map<String, Object> csvSettings = (Map<String, Object>) settings.settings().get("csv_file");
+                folderName = XContentMapValues.nodeStringValue(csvSettings.get("folder"), null);
+                filenamePattern = XContentMapValues.nodeStringValue(csvSettings.get("filename_pattern"), ".*\\.csv$");
+                
                 File lastProcessedFile = null;
                 try {
                     File files[] = getFiles();
                     for (File file : files) {
-                        logger.info("Processing file {}", file.getName());
-                        file = renameFile(file, ".processing");
-                        lastProcessedFile = file;
-
-                        processFile(file);
-
-                        file = renameFile(file, ".imported");
-                        lastProcessedFile = file;
-                        processBulkIfNeeded();
+                    	if(closed)
+                    	{
+                    		break;
+                    	}
+                    	
+                    	try
+                    	{
+	                        logger.info("Processing file {}", file.getName());
+	                        file = renameFile(file, ".processing");
+	                        lastProcessedFile = file;
+	
+	                        processReader(new BufferedReader(new FileReader(file)),file.getAbsolutePath());
+	
+	                        file = renameFile(file, ".imported");
+	                        lastProcessedFile = file;
+                    	}
+                    	catch (Exception e) {
+                            if (lastProcessedFile != null) {
+                                renameFile(lastProcessedFile, ".error");
+                                logger.error("Error processing file {}", e,lastProcessedFile);
+                            }
+                            else
+                            {
+                            	logger.error("Error processing file {}", e,file);
+                            }
+                        }
                     }
-                    delay();
                 } catch (Exception e) {
                     if (lastProcessedFile != null) {
                         renameFile(lastProcessedFile, ".error");
@@ -208,6 +274,39 @@ public class CSVRiver extends AbstractRiverComponent implements River {
                     return;
                 }
             }
+            else if(settings.settings().containsKey("csv_uri"))
+            {
+            	CloseableHttpClient httpClient=HttpClients.createDefault();
+            	String uri=XContentMapValues.nodeStringValue(settings.settings().get("csv_uri"), null);
+            	HttpGet get=new HttpGet(uri);
+            	CloseableHttpResponse response=null;
+            	try
+            	{
+            		response=httpClient.execute(get);
+            		reader=new BufferedReader(new InputStreamReader(response.getEntity().getContent()));
+            		processReader(reader,uri);
+				} catch (Exception e) {
+					logger.error("Error invoking URI",e);
+				}
+            	finally
+            	{
+            		try
+            		{
+            			response.close();
+            		}
+            		catch(IOException e)
+            		{
+            			logger.error("Could not close HTTP response", e);
+            		}
+            	}
+            }
+            else
+            {
+            	logger.warn("No data to process.");
+            }
+            
+        	logger.info("done processing");
+            delay();
         }
 
         private File renameFile(File file, String suffix) {
@@ -228,22 +327,49 @@ public class CSVRiver extends AbstractRiverComponent implements River {
             });
         }
 
-        private void processFile(File file) throws IOException {
-            CSVReader reader = new CSVReader(new FileReader(file), separator, quoteCharacter, escapeCharacter);
+        private void processReader(Reader reader, String streamName) throws IOException {
+        	long line=0;
+            CSVReader csv = new CSVReader(reader, separator, quoteCharacter, escapeCharacter);
             String[] nextLine;
-            while ((nextLine = reader.readNext()) != null) {
-                if (nextLine.length > 0 && !(nextLine.length == 1 && nextLine[0].trim().equals(""))) {
-                    XContentBuilder builder = XContentFactory.jsonBuilder();
-                    builder.startObject();
-
-                    int position = 0;
-                    for (Object fieldName : csvFields) {
-                        builder.field((String) fieldName, nextLine[position++]);
-                    }
-                    builder.endObject();
-                    currentRequest.add(Requests.indexRequest(indexName).type(typeName).id(UUID.randomUUID().toString()).create(true).source(builder));
-                }
-                processBulkIfNeeded();
+            try
+            {
+	            while ( !closed && (nextLine = csv.readNext()) != null) {
+	            	line++;
+	            	if(nextLine.length==csvFields.size()) {
+	                    XContentBuilder builder = XContentFactory.jsonBuilder();
+	                    builder.startObject();
+	
+	                    for(int ii=0;ii<csvFields.size();ii++)
+	                    {
+	                    	builder.field((String) csvFields.get(ii), nextLine[ii]);
+	                    }
+	                    
+	                    builder.endObject();
+	                    logger.trace("Adding request to bulk");
+	                    currentRequest.add(Requests.indexRequest(indexName).type(typeName).source(builder));
+	                }
+	            	else
+	            	{
+	            		logger.warn("Could not process line {}:{}, found {} fields, expecting {}",streamName,line,nextLine.length,csvFields.size());
+	            	}
+	                processBulkIfNeeded(false,line);
+	            }
+	            processBulkIfNeeded(true,line);
+            }
+            catch(IOException e)
+            {
+            	throw new IOException(e);
+            }
+            finally
+            {
+            	try
+            	{
+            		csv.close();
+            	}
+            	catch(IOException ie)
+            	{
+            		logger.error("Failed to close CSVReader", ie);
+            	}
             }
         }
     }

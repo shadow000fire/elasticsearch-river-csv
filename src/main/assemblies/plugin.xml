@@ -18,9 +18,6 @@
             <outputDirectory>/</outputDirectory>
             <useProjectArtifact>true</useProjectArtifact>
             <useTransitiveFiltering>true</useTransitiveFiltering>
-            <includes>
-                <include>net.sf.opencsv:opencsv</include>
-            </includes>
         </dependencySet>
     </dependencySets>
 </assembly>

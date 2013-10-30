@@ -1,7 +1,9 @@
 CSV River Plugin for ElasticSearch
 ==================================
 
-The CSV River plugin allows index CSV files in folder.
+The CSV River plugin allows you to index CSV files, or more accurately columized files delimiter by any single character.
+
+You should only use one of csv_string, csv_data, csv_uri, csv_file.  The first one found in that order will be used.
 
 In order to install the plugin, simply run: `bin/plugin -install xxBedy/elasticsearch-river-csv/1.0.1`.
 If it doesn't work, clone git repository and build plugin manually.
@@ -23,19 +25,22 @@ Creating the CSV river can be done using:
 	curl -XPUT localhost:9200/_river/my_csv_river/_meta -d '
 	{
 	    "type" : "csv",
+	    "poll":"5m",
+        "fields" : [
+            "column1",
+            "column2",
+            "column3",
+            "column4"
+        ],
+        "field_separator" : ",",
+        "escape_character" : ";",
+        "quote_character" : "'",
+        "csv_string":"1,second,third column",
+        "csv_data":"bXksY3N2LGZpbGU=",
+        "csv_uri":"http://pic.dhe.ibm.com/infocenter/tivihelp/v41r1/topic/com.ibm.ismsaas.doc/reference/LocationsImportSample.csv",
 	    "csv_file" : {
 	        "folder" : "/tmp",
-	        "filename_mask" : ".*\\.csv$",
-	        "poll":"5m",
-	        "fields" : [
-	            "column1",
-	            "column2",
-	            "column3",
-	            "column4"
-	        ],
-   	        "field_separator" : ",",
-   	        "escape_character" : ";",
-   	        "quote_character" : "'"
+	        "filename_pattern" : ".*\\.csv$"	        
 	    },
 	    "index" : {
 	        "index" : "my_csv_data",
