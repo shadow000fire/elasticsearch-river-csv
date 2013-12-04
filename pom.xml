@@ -85,6 +85,46 @@
         	<version>4.3</version>
         </dependency>
     </dependencies>
+	<profiles>
+		<profile>
+			<activation>
+				<os><family>!windows</family></os>
+			</activation>
+			<build>
+				<plugins>
+					<plugin>
+						<groupId>org.codehaus.mojo</groupId>
+						<artifactId>rpm-maven-plugin</artifactId>
+						<version>2.1-alpha-3</version>
+						<extensions>true</extensions>
+						<executions>
+							<execution>
+								<id>attach-rpm</id>
+								<goals>
+									<goal>rpm</goal>
+								</goals>
+							</execution>
+						</executions>
+						<configuration>
+							<copyright>Apache License 2.0</copyright>
+							<group>Application/Internet</group>
+							<defaultFilemode>644</defaultFilemode>
+							<defaultDirmode>755</defaultDirmode>
+							<defaultUsername>root</defaultUsername>
+							<defaultGroupname>root</defaultGroupname>
+							<mappings>
+								<mapping>
+									<directory>/usr/share/elasticsearch/plugins/river-csv</directory>
+									<dependency/>
+									<artifact/>
+								</mapping>
+							</mappings>
+						</configuration>
+					</plugin>
+				</plugins>
+			</build>
+		</profile>
+	</profiles>
 
     <build>
         <plugins>

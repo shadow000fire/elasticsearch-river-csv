@@ -7,3 +7,6 @@
 .idea
 elasticsearch-river-csv.iml
 target
+.classpath
+.project
+.settings/
